@@ -1,0 +1,7 @@
+emoji
+irc
+pyyaml
+requests
+websockets
+
+flake8
