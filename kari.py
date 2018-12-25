@@ -3,14 +3,15 @@ import json
 import logging
 import os
 import re
+import select
 import signal
-import string
+import socket
 import ssl
+import string
 import threading
 import time
 from asyncio import get_event_loop
 from collections import defaultdict
-from functools import partial
 from itertools import zip_longest
 from io import BytesIO
 from os.path import basename
@@ -50,23 +51,25 @@ class Kari:
         self.slack_user_token_header = {
             'Authorization': f"Bearer {config['slack']['user_token']}"
         }
-        resp = self.slack_api('rtm.start')
-        self.slack_channel_name_to_id = {c['name']: c['id'] for c in resp['channels']}
-        self.slack_channel_id_to_name = {c['id']: c['name'] for c in resp['channels']}
+        users_resp = self.slack_api('users.list')
+        channels_resp = self.slack_api('conversations.list')
+
+        self.slack_channel_name_to_id = {c['name']: c['id'] for c in channels_resp['channels']}
+        self.slack_channel_id_to_name = {c['id']: c['name'] for c in channels_resp['channels']}
 
         # Topic data is used for establishing PM linkage as they aren't explicitly mapped
         network_to_pm_channels = defaultdict(list)
-        for channel in resp['channels']:
+        for channel in channels_resp['channels']:
             if 'topic' in channel and '/' in channel['topic']['value']:
                 network, target = channel['topic']['value'].split('/', 1)
                 network_to_pm_channels[network].append(('#' + channel['name'], target))
 
-        self.slack_own_user_id = [u['id'] for u in resp['users'] if u['name'] == config['slack']['username']][0]
-        self.slack_user_id_to_name = {u['id']: u['name'] for u in resp['users']}
+        self.slack_own_user_id = [u['id'] for u in users_resp['members'] if u['name'] == config['slack']['username']][0]
+        self.slack_user_id_to_name = {u['id']: u['name'] for u in users_resp['members']}
 
         self.slack_pending_thread_reply = None
 
-        slack_channel_name_to_membership = {c['name']: c['is_member'] for c in resp['channels']}
+        slack_channel_name_to_membership = {c['name']: c['is_member'] for c in channels_resp['channels']}
 
         if not slack_channel_name_to_membership[config['slack']['errors'][1:]]:
             raise ValueError(f"Bot not joined to configured slack channel {config['slack']['errors']}")
@@ -75,43 +78,9 @@ class Kari:
         self.slack_ws = None
 
         # Set up IRC
-        reactor = irc.client.Reactor()
-        self.slack_channel_to_irc = {}
-        self.irc_conn_to_conf = {}
-        self.irc_conf_name_to_conn = {}
-
-        for name, irc_conf in config['irc'].items():
-            irc_conn = reactor.server().connect(
-                server=irc_conf['hostname'],
-                port=int(irc_conf['port']),
-                nickname=irc_conf['nickname'],
-                password=irc_conf['password'],
-                connect_factory=irc.connection.Factory(
-                    wrapper=ssl.wrap_socket if irc_conf['ssl'] else lambda x: x
-                ),
-            )
-
-            irc_conf['name'] = name
-            self.irc_conn_to_conf[irc_conn] = irc_conf
-            self.irc_conf_name_to_conn[name] = irc_conn
-
-            for irc_channel, slack_channel in irc_conf['channels'].items():
-                if not slack_channel_name_to_membership[slack_channel[1:]]:
-                    raise ValueError(f'Bot not joined to configured slack channel {slack_channel}')
-
-                self.slack_channel_to_irc[slack_channel] = (irc_conn, irc_channel)
-
-            for slack_channel, target in network_to_pm_channels[name]:
-                self.slack_channel_to_irc[slack_channel] = (irc_conn, target)
-                # Not entirely correct...
-                irc_conf['channels'][target] = slack_channel
-
-        reactor.add_global_handler('pubmsg', self.irc_message)
-        reactor.add_global_handler('privmsg', self.irc_message)
-        reactor.add_global_handler('action', self.irc_message)
-        # No reason to poll so hard, we should believe select(3) works.
         irc_thread = threading.Thread(
-            target=partial(reactor.process_forever, timeout=20.0),
+            target=self.irc_connect,
+            args=(config, network_to_pm_channels, slack_channel_name_to_membership),
             daemon=True,
         )
         irc_thread.start()
@@ -122,18 +91,21 @@ class Kari:
         self.loop = get_event_loop()
 
         # Cede control to asyncio -> slack.
-        self.loop.run_until_complete(self.slack_connect(resp))
+        self.loop.run_until_complete(self.slack_connect())
 
     def thread_bomb(self, target):
         target.join()
         os.kill(os.getpid(), signal.SIGTERM)
 
     def slack_api(self, endpoint, params=None, headers=None):
+        before = time.time()
         resp = self.slack_session.post(
             f'https://slack.com/api/{endpoint}',
             data=params,
             headers=headers,
         )
+        duration = time.time() - before
+        log.info(f"API request took {duration}s")
         resp.raise_for_status()
         resp = resp.json()
 
@@ -145,13 +117,69 @@ class Kari:
 
         return resp
 
-    async def slack_connect(self, resp):
-        async with websockets.connect(resp['url']) as ws:
-            self.slack_ws = ws
-            while True:
-                msg = await ws.recv()
-                msg = json.loads(msg)
-                self.slack_message(msg)
+    def irc_connect(self, config, network_to_pm_channels, slack_channel_name_to_membership):
+        while True:
+            reactor = irc.client.Reactor()
+            self.slack_channel_to_irc = {}
+            self.irc_conn_to_conf = {}
+            self.irc_conf_name_to_conn = {}
+
+            for name, irc_conf in config['irc'].items():
+                irc_conn = reactor.server().connect(
+                    server=irc_conf['hostname'],
+                    port=int(irc_conf['port']),
+                    nickname=irc_conf['nickname'],
+                    password=irc_conf['password'],
+                    connect_factory=irc.connection.Factory(
+                        wrapper=ssl.wrap_socket if irc_conf['ssl'] else lambda x: x
+                    ),
+                )
+
+                irc_conf['name'] = name
+                self.irc_conn_to_conf[irc_conn] = irc_conf
+                self.irc_conf_name_to_conn[name] = irc_conn
+
+                for irc_channel, slack_channel in irc_conf['channels'].items():
+                    if not slack_channel_name_to_membership[slack_channel[1:]]:
+                        raise ValueError(f'Bot not joined to configured slack channel {slack_channel}')
+
+                    self.slack_channel_to_irc[slack_channel] = (irc_conn, irc_channel)
+
+                for slack_channel, target in network_to_pm_channels[name]:
+                    self.slack_channel_to_irc[slack_channel] = (irc_conn, target)
+                    # Not entirely correct...
+                    irc_conf['channels'][target] = slack_channel
+                    log.info(f'Set up PM bridge between {slack_channel} and {target}')
+
+            reactor.add_global_handler('pubmsg', self.irc_message)
+            reactor.add_global_handler('privmsg', self.irc_message)
+            reactor.add_global_handler('action', self.irc_message)
+
+            try:
+                # No reason to poll so hard, we should believe select(3) works.
+                reactor.process_forever(timeout=60.0)
+            except select.error as ex:
+                log.error(f'Received exception from irc sockets: {ex}, reconnecting')
+                for sock in reactor.sockets:
+                    sock.shutdown(socket.SHUT_RDWR)
+                    sock.close()
+
+    async def slack_connect(self):
+        while True:
+            resp = self.slack_api('rtm.connect')
+            try:
+                async with websockets.connect(resp['url'], ping_interval=60.0) as ws:
+                    self.slack_ws = ws
+                    while True:
+                        msg = await ws.recv()
+                        msg = json.loads(msg)
+                        self.slack_message(msg)
+            except websockets.exceptions.ConnectionClosed as ex:
+                log.error(f'Received exception from websockets: {ex}, reconnecting')
+                self.slack_error(f'Received exception from websockets: {ex}, reconnecting')
+            except ConnectionError as ex:
+                log.error(f'Received exception from sockets: {ex}, reconnecting')
+                self.slack_error(f'Received exception from sockets: {ex}, reconnecting')
 
     def irc_message(self, conn, event):
         if not self.slack_ws:
@@ -241,7 +269,7 @@ class Kari:
                 'text': reformat_irc(text),
                 'channel': self.slack_channel_name_to_id[channel_name],
                 'icon_url': self.irc_username_to_slack_avatar.get(
-                    irc_conf['users'].get(
+                    irc_conf.get('users', {}).get(
                         event.source.nick
                     ) or event.source.nick.lower(),
                     '',
@@ -441,15 +469,33 @@ def apply_span(msg, span, md_char):
         end = len(msg)
         msg.append('')
 
+    # Move the bold in if the leading character is a space,
+    # for which Slack won't bold the span.
+    real_begin = begin
+    while msg[begin + 1] == ' ':
+        begin += 1
+
+    # Insert the substitute character with a zero width space if necessary.
     if begin == 0 or msg[begin - 1] not in LETTERS_NUMBERS:
         msg[begin] = md_char
     else:
         msg[begin] = '\u200b' + md_char
 
+    # Add back the space.
+    if begin != real_begin:
+        msg[real_begin] = ' '
+
+    real_end = end
+    while msg[end - 1] == ' ':
+        end -= 1
+
     if end == len(msg) - 1 or msg[end + 1] not in LETTERS_NUMBERS:
         msg[end] = md_char
     else:
         msg[end] = md_char + '\u200b'
+
+    if end != real_end:
+        msg[real_end] = ' '
 
 
 def reformat_irc(msg):
@@ -492,6 +538,10 @@ def delink(match):
         _, name = inner.split('|')
         return '#' + name
     else:
+        # URL: maybe resolved, maybe not
+        if '|' in inner:
+            full_url, display_url = inner.split('|')
+            return full_url
         return inner
 
 
@@ -504,8 +554,9 @@ def reformat_slack(msg):
     msg = re.sub(r'<([^>]+)>', delink, msg)
     # Convert Markdown bold and italics to equivalent
     # These have to have come in pairs so it's slightly easier
-    msg = re.sub(r'(?<![a-zA-Z0-9])\*([^\*]+)\*(?![a-zA-Z0-9])', '\x02\\1\x02', msg)
-    msg = re.sub(r'(?<![a-zA-Z0-9])_([^_]+)_(?![a-zA-Z0-9])', '\x1d\\1\x1d', msg)
+    # We accept either a leading space, trailing space, or neither, but not both.
+    msg = re.sub(r'(?<![a-zA-Z0-9])\*([^ \*][^\*]*|[^\*][^ \*]*)\*(?![a-zA-Z0-9])', '\x02\\1\x02', msg)
+    msg = re.sub(r'(?<![a-zA-Z0-9])_([^ _][^_]*|[^_][^ _]*)_(?![a-zA-Z0-9])', '\x1d\\1\x1d', msg)
     # Remove emoji shortcodes and url escapes.
     msg = emojize(html.unescape(msg))
     return msg
