@@ -200,6 +200,10 @@ class Kari:
         else:
             if event.source.nick in irc_conf['channels']:
                 channel_name = irc_conf['channels'][event.source.nick][1:]
+            # Control message?
+            elif event.source.nick.startswith('*'):
+                self.slack_error(reformat_irc(text))
+                return
             else:
                 # Time to create channel!
                 channel_name = f'dm-{event.source.nick.lower()[:18]}'
@@ -217,12 +221,16 @@ class Kari:
                     },
                     headers=self.slack_user_token_header,
                 )
+                if not resp['ok']:
+                    log.error('Error received from Slack API: %s', resp)
+                    self.slack_error(f'Error received from Slack API: ```{resp}```')
+                    return
 
                 channel_id = resp['channel']['id']
                 self.slack_channel_name_to_id[channel_name] = channel_id
                 self.slack_channel_id_to_name[channel_id] = channel_name
 
-                self.slack_api(
+                resp = self.slack_api(
                     'channels.invite',
                     {
                         'channel': channel_id,
@@ -230,7 +238,12 @@ class Kari:
                     },
                     headers=self.slack_user_token_header,
                 )
-                self.slack_api(
+                if not resp['ok']:
+                    log.error('Error received from Slack API: %s', resp)
+                    self.slack_error(f'Error received from Slack API: ```{resp}```')
+                    return
+
+                resp = self.slack_api(
                     'channels.setTopic',
                     {
                         'channel': channel_id,
@@ -238,6 +251,11 @@ class Kari:
                     },
                     headers=self.slack_user_token_header,
                 )
+                if not resp['ok']:
+                    log.error('Error received from Slack API: %s', resp)
+                    self.slack_error(f'Error received from Slack API: ```{resp}```')
+                    return
+
                 # For some reason, only url params are allowed on this one.
                 self.slack_api('users.prefs.setNotifications?' + urlencode({
                     'channel_id': channel_id,
@@ -245,12 +263,21 @@ class Kari:
                     'value': 'everything',
                     'global': 0,
                 }), headers=self.slack_user_token_header)
+                if not resp['ok']:
+                    log.error('Error received from Slack API: %s', resp)
+                    self.slack_error(f'Error received from Slack API: ```{resp}```')
+                    return
+
                 self.slack_api('users.prefs.setNotifications?' + urlencode({
                     'channel_id': channel_id,
                     'name': 'mobile',
                     'value': 'everything',
                     'global': 0,
                 }), headers=self.slack_user_token_header)
+                if not resp['ok']:
+                    log.error('Error received from Slack API: %s', resp)
+                    self.slack_error(f'Error received from Slack API: ```{resp}```')
+                    return
 
                 self.slack_channel_to_irc['#' + channel_name] = (conn, event.source.nick)
                 # Not entirely correct...
@@ -258,7 +285,6 @@ class Kari:
 
         if not channel_name:
             log.error('%s not configured for slack, ignoring', event.target)
-            self.slack_error(f'{event.target} not configured for slack, ignoring')
             return
 
         # Can't impersonate user from RTM API, have to use postMessage.
