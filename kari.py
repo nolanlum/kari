@@ -153,6 +153,7 @@ class Kari:
                     self.slack_channel_to_irc[slack_channel] = (irc_conn, target)
                     # Not entirely correct...
                     irc_conf['channels'][target] = slack_channel
+                    slack_channel_name_to_membership[slack_channel[1:]] = True
                     log.info(f'Set up PM bridge between {slack_channel} and {target}')
 
             reactor.add_global_handler('pubmsg', self.irc_message)
