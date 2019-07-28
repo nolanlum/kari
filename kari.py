@@ -174,7 +174,15 @@ class Kari:
 
     async def slack_connect(self):
         while True:
-            resp = self.slack_api('rtm.connect')
+            try:
+                resp = self.slack_api('rtm.connect')
+            except requests.exceptions.HTTPError as ex:
+                log.error(f'Exception calling rtm.connect: {ex}, reconnecting')
+                # Will this work if we had troubles with rtm.connect? No idea!
+                try:
+                    self.slack_error(f'Exception calling rtm.connect: {ex}, reconnecting')
+                except requests.exceptions.HTTPError as ex2:
+                    log.error(f'Exception reporting exception: {ex2}')
             try:
                 async with websockets.connect(resp['url'], ping_interval=60.0) as ws:
                     self.slack_ws = ws
