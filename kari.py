@@ -117,7 +117,7 @@ class Kari:
             log.error('Error received from Slack API: %s', resp)
             if endpoint != 'chat.postMessage':
                 # Hopefully no loops are created.
-                self.slack_error(f'Error received from Slack API: ```{resp}```')
+                self.slack_error(f'Error from Slack API: ```{resp}```')
 
         return resp
 
@@ -217,7 +217,10 @@ class Kari:
                 channel_name = irc_conf['channels'][event.source.nick][1:]
             # Control message?
             elif event.source.nick.startswith('*'):
-                self.slack_error(reformat_irc(text))
+                self.slack_error("Message from internal {}: {}".format(
+                    event.source.nick,
+                    reformat_irc(text),
+                ))
                 return
             else:
                 # Time to create channel!
@@ -237,8 +240,8 @@ class Kari:
                     headers=self.slack_user_token_header,
                 )
                 if not resp['ok']:
-                    log.error('Error received from Slack API: %s', resp)
-                    self.slack_error(f'Error received from Slack API: ```{resp}```')
+                    log.error('Error from Slack API: %s', resp)
+                    self.slack_error(f'Error from Slack API: ```{resp}```')
                     return
 
                 channel_id = resp['channel']['id']
@@ -254,8 +257,8 @@ class Kari:
                     headers=self.slack_user_token_header,
                 )
                 if not resp['ok']:
-                    log.error('Error received from Slack API: %s', resp)
-                    self.slack_error(f'Error received from Slack API: ```{resp}```')
+                    log.error('Error from Slack API: %s', resp)
+                    self.slack_error(f'Error from Slack API: ```{resp}```')
                     return
 
                 resp = self.slack_api(
@@ -267,8 +270,8 @@ class Kari:
                     headers=self.slack_user_token_header,
                 )
                 if not resp['ok']:
-                    log.error('Error received from Slack API: %s', resp)
-                    self.slack_error(f'Error received from Slack API: ```{resp}```')
+                    log.error('Error from Slack API: %s', resp)
+                    self.slack_error(f'Error from Slack API: ```{resp}```')
                     return
 
                 # For some reason, only url params are allowed on this one.
@@ -279,8 +282,8 @@ class Kari:
                     'global': 0,
                 }), headers=self.slack_user_token_header)
                 if not resp['ok']:
-                    log.error('Error received from Slack API: %s', resp)
-                    self.slack_error(f'Error received from Slack API: ```{resp}```')
+                    log.error('Error from Slack API: %s', resp)
+                    self.slack_error(f'Error from Slack API: ```{resp}```')
                     return
 
                 self.slack_api('users.prefs.setNotifications?' + urlencode({
@@ -290,8 +293,8 @@ class Kari:
                     'global': 0,
                 }), headers=self.slack_user_token_header)
                 if not resp['ok']:
-                    log.error('Error received from Slack API: %s', resp)
-                    self.slack_error(f'Error received from Slack API: ```{resp}```')
+                    log.error('Error from Slack API: %s', resp)
+                    self.slack_error(f'Error from Slack API: ```{resp}```')
                     return
 
                 self.slack_channel_to_irc['#' + channel_name] = (conn, event.source.nick)
@@ -500,8 +503,8 @@ class Kari:
             # XXX: Add reconnection logic
             pass
         elif type_ == 'error':
-            log.error('Error received from Slack stream: %s', msg)
-            self.slack_error(f'Error received from Slack stream: ```{msg}```')
+            log.error('Error from Slack stream: %s', msg)
+            self.slack_error(f'Error from Slack stream: ```{msg}```')
 
 
 def apply_span(msg, span, md_char):
