@@ -30,6 +30,10 @@ LETTERS_NUMBERS = string.ascii_letters + string.digits
 log = logging.getLogger('kari')
 
 
+class IRCDisconnection(Exception):
+    pass
+
+
 class Kari:
     def __init__(self):
         config = yaml.safe_load(open('config.yaml'))
@@ -154,12 +158,15 @@ class Kari:
             reactor.add_global_handler('pubmsg', self.irc_message)
             reactor.add_global_handler('privmsg', self.irc_message)
             reactor.add_global_handler('action', self.irc_message)
+            # reactor will actually not stop for this, if the server says it's over,
+            # reactor will just continue processing an empty list of sockets.
+            reactor.add_global_handler('disconnect', self.irc_disconnect)
 
             try:
                 # No reason to poll so hard, we should believe select(3) works.
                 reactor.process_forever(timeout=60.0)
-            except select.error as ex:
-                log.error(f'Received exception from irc sockets: {ex}, reconnecting')
+            except (select.error, IRCDisconnection) as ex:
+                log.error(f'Received exception from irc: {str(ex)}, reconnecting')
                 for sock in reactor.sockets:
                     sock.shutdown(socket.SHUT_RDWR)
                     sock.close()
@@ -175,11 +182,19 @@ class Kari:
                         msg = json.loads(msg)
                         self.slack_message(msg)
             except websockets.exceptions.ConnectionClosed as ex:
-                log.error(f'Received exception from websockets: {ex}, reconnecting')
-                self.slack_error(f'Received exception from websockets: {ex}, reconnecting')
+                log.error(f'Exception from websockets: {ex}, reconnecting')
             except ConnectionError as ex:
-                log.error(f'Received exception from sockets: {ex}, reconnecting')
-                self.slack_error(f'Received exception from sockets: {ex}, reconnecting')
+                log.error(f'Exception from sockets: {ex}, reconnecting')
+                self.slack_error(f'Exception from sockets: {ex}, reconnecting')
+            except OSError as ex:
+                # We don't look at errno too hard because it isn't exposed
+                # in the case of a "combined exception" (asyncio stuff).
+                log.error(f'OSError: (maybe socket related): {ex}, reconnecting')
+                self.slack_error(f'OSError: (maybe socket related): {ex}, reconnecting')
+
+    def irc_disconnect(self, conn, event):
+        # Throw control back to irc_connect
+        raise IRCDisconnection()
 
     def irc_message(self, conn, event):
         if not self.slack_ws:
