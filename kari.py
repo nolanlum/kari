@@ -184,6 +184,11 @@ class Kari:
                     self.slack_error(f'Exception calling rtm.connect: {ex}, reconnecting')
                 except requests.exceptions.HTTPError as ex2:
                     log.error(f'Exception reporting exception: {ex2}')
+            except Exception as ex:
+                log.error(f'Last resort Exception calling rtm.connect: {ex}, reconnecting')
+                self.slack_error(f'Last resort Exception calling rtm.connect: {ex}, reconnecting')
+                self.slack_error('Please add a new case for this exception.')
+
             try:
                 async with websockets.connect(resp['url'], ping_interval=60.0) as ws:
                     self.slack_ws = ws
@@ -201,6 +206,10 @@ class Kari:
                 # in the case of a "combined exception" (asyncio stuff).
                 log.error(f'OSError: (maybe socket related): {ex}, reconnecting')
                 self.slack_error(f'OSError: (maybe socket related): {ex}, reconnecting')
+            except Exception as ex:
+                log.error(f'Last resort Exception: {ex}, reconnecting')
+                self.slack_error(f'Last resort Exception: {ex}, reconnecting')
+                self.slack_error('Please add a new case for this exception.')
 
     def irc_disconnect(self, conn, event):
         # Throw control back to irc_connect
