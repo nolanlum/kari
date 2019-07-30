@@ -13,6 +13,7 @@ import time
 from asyncio import get_event_loop
 from collections import defaultdict
 from itertools import zip_longest
+from hashlib import md5
 from io import BytesIO
 from os.path import basename
 from urllib.parse import urlencode
@@ -314,18 +315,25 @@ class Kari:
             log.error('%s not configured for slack, ignoring', event.target)
             return
 
+        nick = event.source.nick
+        if event.source.nick in irc_conf.get('deprefix', []):
+            m = re.match(r'<([^>]+)> (.*)', text)
+            if m:
+                nick = m[1]
+                text = m[2]
+
         # Can't impersonate user from RTM API, have to use postMessage.
         self.slack_api(
             "chat.postMessage",
             {
-                'username': event.source.nick,
+                'username': nick,
                 'text': reformat_irc(text),
                 'channel': self.slack_channel_name_to_id[channel_name],
                 'icon_url': self.irc_username_to_slack_avatar.get(
                     irc_conf.get('users', {}).get(
-                        event.source.nick
-                    ) or event.source.nick.lower(),
-                    '',
+                        nick
+                    ) or nick.lower(),
+                    f'https://www.gravatar.com/avatar/{md5(nick.lower().encode("utf-8")).hexdigest()}?d=retro&s=1024',
                 ),
             }
         )
