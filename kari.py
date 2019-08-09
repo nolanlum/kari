@@ -91,8 +91,6 @@ class Kari:
             'Authorization': f"Bearer {config['slack']['user_token']}"
         }
 
-        self.bridged_channels = KeyViewList()
-
         self.slack_channels = KeyViewList(self.slack_api('conversations.list')['channels'])
         users = KeyViewList(self.slack_api('users.list')['members'])
 
@@ -675,6 +673,15 @@ def reformat_irc(msg):
 
     for span in italic_spans:
         apply_span(msg, span, '_')
+
+    tilde_idxs = (m.start() for m in re.finditer('~', orig_msg))
+    tilde_spans = zip_longest(*[iter(tilde_idxs)] * 2)
+
+    # Strictly speaking, there are a few cases where this is not necessary.
+    for span in tilde_spans:
+        begin, end = span
+        msg[begin] = '\u200b~'
+        msg[end] = '~\u200b'
 
     return ''.join(msg)
 
