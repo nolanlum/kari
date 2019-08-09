@@ -1,3 +1,4 @@
+attrs
 emoji
 irc
 pyyaml

@@ -9,6 +9,7 @@ import socket
 import ssl
 import string
 import threading
+import traceback
 import time
 from asyncio import get_event_loop
 from collections import defaultdict
@@ -16,13 +17,15 @@ from itertools import zip_longest
 from hashlib import md5
 from io import BytesIO
 from os.path import basename
-from urllib.parse import urlencode
 
+import attr
 import requests
 import websockets
 import irc.client
 import yaml
 import emoji
+
+from key_view import KeyViewList
 
 
 LETTERS_NUMBERS = string.ascii_letters + string.digits
@@ -31,13 +34,44 @@ LETTERS_NUMBERS = string.ascii_letters + string.digits
 log = logging.getLogger('kari')
 
 
-class IRCDisconnection(Exception):
+class Disconnection(Exception):
     pass
+
+
+@attr.s
+class IRCServer:
+    conf = attr.ib()
+    conn = attr.ib()
+
+    @property
+    def name(self):
+        return self.conf['name']
+
+
+@attr.s
+class IRCChannel:
+    name = attr.ib()
+    server = attr.ib()
+
+    @classmethod
+    def get_full_name(cls, server_name, channel_name):
+        return f'{server_name}:{channel_name}'
+
+    @property
+    def full_name(self):
+        return self.get_full_name(self.server.conf['name'], self.name)
+
+
+@attr.s
+class Bridge:
+    slack_channel = attr.ib()
+    irc_channel = attr.ib()
 
 
 class Kari:
     def __init__(self):
-        config = yaml.safe_load(open('config.yaml'))
+        with open('config.yaml') as fh:
+            config = yaml.safe_load(fh)
 
         self.mirror_conf = config['slack']['file_mirror']
 
@@ -56,36 +90,72 @@ class Kari:
         self.slack_user_token_header = {
             'Authorization': f"Bearer {config['slack']['user_token']}"
         }
-        users_resp = self.slack_api('users.list')
-        channels_resp = self.slack_api('conversations.list')
 
-        self.slack_channel_name_to_id = {c['name']: c['id'] for c in channels_resp['channels']}
-        self.slack_channel_id_to_name = {c['id']: c['name'] for c in channels_resp['channels']}
+        self.bridged_channels = KeyViewList()
 
-        # Topic data is used for establishing PM linkage as they aren't explicitly mapped
-        network_to_pm_channels = defaultdict(list)
-        for channel in channels_resp['channels']:
-            if 'topic' in channel and '/' in channel['topic']['value']:
-                network, target = channel['topic']['value'].split('/', 1)
-                network_to_pm_channels[network].append(('#' + channel['name'], target))
+        self.slack_channels = KeyViewList(self.slack_api('conversations.list')['channels'])
+        users = KeyViewList(self.slack_api('users.list')['members'])
 
-        self.slack_own_user_id = [u['id'] for u in users_resp['members'] if u['name'] == config['slack']['username']][0]
-        self.slack_user_id_to_name = {u['id']: u['name'] for u in users_resp['members']}
+        self.slack_channel_by_name = self.slack_channels.register_itemgetter('name')
+        self.slack_channel_by_id = self.slack_channels.register_itemgetter('id')
+
+        self.slack_own_user_id = [u['id'] for u in users if u['name'] == config['slack']['username']][0]
+        self.slack_user_by_id = users.register_itemgetter('id')
+
+        self._init_error_channel(config['slack']['errors'][1:])
 
         self.slack_pending_thread_reply = None
-
-        slack_channel_name_to_membership = {c['name']: c['is_member'] for c in channels_resp['channels']}
-
-        if not slack_channel_name_to_membership[config['slack']['errors'][1:]]:
-            raise ValueError(f"Bot not joined to configured slack channel {config['slack']['errors']}")
-        self.slack_error_channel = self.slack_channel_name_to_id[config['slack']['errors'][1:]]
-
         self.slack_ws = None
+
+        self.bridges = KeyViewList()
+        self.bridge_by_irc_full_name = self.bridges.register_attrgetter('irc_channel.full_name')
+        self.bridge_by_slack_channel = self.bridges.register_attrgetter('slack_channel')
+
+        self.irc_servers = KeyViewList()
+        self.irc_server_by_conn = self.irc_servers.register_attrgetter('conn')
+        self.irc_server_by_name = self.irc_servers.register_attrgetter('name')
+
+        # Topic data is used for establishing PM linkage as they aren't explicitly mapped
+        irc_server_to_pm_channels = defaultdict(list)
+        for channel in self.slack_channels:
+            if 'topic' in channel:
+                pm_config = self._extract_pm_config(channel['topic']['value'])
+                if pm_config:
+                    log.info(f'Found PM configuration for {channel["name"]}: {pm_config}')
+                    irc_server_to_pm_channels[
+                        pm_config['server']
+                    ].append(
+                        (pm_config['target'], '#' + channel['name']),
+                    )
+
+        for irc_conf in config['irc']:
+            irc_server = IRCServer(conf=irc_conf, conn=None)
+            self.irc_servers.append(irc_server)
+
+            for irc_channel_name, slack_channel_name in irc_conf['channels'].items():
+                slack_channel = self.slack_channel_by_name[slack_channel_name[1:]]
+                if not slack_channel['is_member']:
+                    self._slack_invite(slack_channel['id'])
+                irc_channel = IRCChannel(name=irc_channel_name, server=irc_server)
+                bridge = Bridge(slack_channel=slack_channel_name, irc_channel=irc_channel)
+                log.debug(f'Setting up bridge: {bridge}')
+
+                self.bridges.append(bridge)
+
+            for irc_target_user_name, slack_channel_name in irc_server_to_pm_channels[irc_conf['name']]:
+                slack_channel = self.slack_channel_by_name[slack_channel_name[1:]]
+                if not slack_channel['is_member']:
+                    self._slack_invite(slack_channel['id'])
+                irc_channel = IRCChannel(name=irc_target_user_name, server=irc_server)
+                bridge = Bridge(slack_channel=slack_channel_name, irc_channel=irc_channel)
+                log.debug(f'Setting up bridge: {bridge}')
+
+                self.bridges.append(bridge)
 
         # Set up IRC
         irc_thread = threading.Thread(
             target=self.irc_connect,
-            args=(config, network_to_pm_channels, slack_channel_name_to_membership),
+            args=(config,),
             daemon=True,
         )
         irc_thread.start()
@@ -97,6 +167,16 @@ class Kari:
 
         # Cede control to asyncio -> slack.
         self.loop.run_until_complete(self.slack_connect())
+
+    def _init_error_channel(self, error_channel_name):
+        error_channel = self.slack_channel_by_name.get(error_channel_name)
+
+        if not error_channel:
+            raise ValueError(f'Configured error channel #{error_channel_name} does not exist')
+
+        if not error_channel['is_member']:
+            raise ValueError(f"Bot not joined to configured slack channel #{error_channel_name}")
+        self.slack_error_channel_id = error_channel['id']
 
     def thread_bomb(self, target):
         target.join()
@@ -122,52 +202,35 @@ class Kari:
 
         return resp
 
-    def irc_connect(self, config, network_to_pm_channels, slack_channel_name_to_membership):
+    def irc_connect(self, config):
         while True:
             reactor = irc.client.Reactor()
-            self.slack_channel_to_irc = {}
-            self.irc_conn_to_conf = {}
-            self.irc_conf_name_to_conn = {}
 
-            for name, irc_conf in config['irc'].items():
-                irc_conn = reactor.server().connect(
-                    server=irc_conf['hostname'],
-                    port=int(irc_conf['port']),
-                    nickname=irc_conf['nickname'],
-                    password=irc_conf['password'],
+            for irc_server in self.irc_servers:
+                irc_server.conn = reactor.server().connect(
+                    server=irc_server.conf['hostname'],
+                    port=int(irc_server.conf['port']),
+                    nickname=irc_server.conf['nickname'],
+                    password=irc_server.conf['password'],
                     connect_factory=irc.connection.Factory(
-                        wrapper=ssl.wrap_socket if irc_conf['ssl'] else lambda x: x
+                        wrapper=ssl.wrap_socket if irc_server.conf['ssl'] else lambda x: x
                     ),
                 )
 
-                irc_conf['name'] = name
-                self.irc_conn_to_conf[irc_conn] = irc_conf
-                self.irc_conf_name_to_conn[name] = irc_conn
-
-                for irc_channel, slack_channel in irc_conf['channels'].items():
-                    if not slack_channel_name_to_membership[slack_channel[1:]]:
-                        raise ValueError(f'Bot not joined to configured slack channel {slack_channel}')
-
-                    self.slack_channel_to_irc[slack_channel] = (irc_conn, irc_channel)
-
-                for slack_channel, target in network_to_pm_channels[name]:
-                    self.slack_channel_to_irc[slack_channel] = (irc_conn, target)
-                    # Not entirely correct...
-                    irc_conf['channels'][target] = slack_channel
-                    slack_channel_name_to_membership[slack_channel[1:]] = True
-                    log.info(f'Set up PM bridge between {slack_channel} and {target}')
+            # Necessary because the view key is conn which we just assigned to
+            self.irc_servers.refresh()
 
             reactor.add_global_handler('pubmsg', self.irc_message)
             reactor.add_global_handler('privmsg', self.irc_message)
             reactor.add_global_handler('action', self.irc_message)
-            # reactor will actually not stop for this, if the server says it's over,
+            # reactor will actually not stop for this by default, if the server says it's over,
             # reactor will just continue processing an empty list of sockets.
             reactor.add_global_handler('disconnect', self.irc_disconnect)
 
             try:
                 # No reason to poll so hard, we should believe select(3) works.
                 reactor.process_forever(timeout=60.0)
-            except (select.error, IRCDisconnection) as ex:
+            except (select.error, Disconnection) as ex:
                 log.error(f'Received exception from irc: {str(ex)}, reconnecting')
                 for sock in reactor.sockets:
                     sock.shutdown(socket.SHUT_RDWR)
@@ -186,8 +249,9 @@ class Kari:
                     log.error(f'Exception reporting exception: {ex2}')
             except Exception as ex:
                 log.error(f'Last resort Exception calling rtm.connect: {ex}, reconnecting')
-                self.slack_error(f'Last resort Exception calling rtm.connect: {ex}, reconnecting')
-                self.slack_error('Please add a new case for this exception.')
+                exc_text = traceback.format_exc()
+                print(exc_text)
+                self.slack_error(f'Last resort Exception calling rtm.connect: {ex}, reconnecting\n```{exc_text}```')
 
             try:
                 async with websockets.connect(resp['url'], ping_interval=60.0) as ws:
@@ -196,8 +260,11 @@ class Kari:
                         msg = await ws.recv()
                         msg = json.loads(msg)
                         self.slack_message(msg)
+            except Disconnection:
+                log.error('Slack remote wants to disconnect gracefully, reconnecting')
             except websockets.exceptions.ConnectionClosed as ex:
                 log.error(f'Exception from websockets: {ex}, reconnecting')
+                self.slack_error(f'Exception from websockets: {ex}, reconnecting')
             except ConnectionError as ex:
                 log.error(f'Exception from sockets: {ex}, reconnecting')
                 self.slack_error(f'Exception from sockets: {ex}, reconnecting')
@@ -208,128 +275,118 @@ class Kari:
                 self.slack_error(f'OSError: (maybe socket related): {ex}, reconnecting')
             except Exception as ex:
                 log.error(f'Last resort Exception: {ex}, reconnecting')
-                self.slack_error(f'Last resort Exception: {ex}, reconnecting')
-                self.slack_error('Please add a new case for this exception.')
+                exc_text = traceback.format_exc()
+                print(exc_text)
+                self.slack_error(f'Last resort Exception: {ex}, reconnecting\n```{exc_text}```')
+
+    def _extract_pm_config(self, topic):
+        m = re.fullmatch(r'(?P<server>[^/]+)/(?P<target>[^/]+)', topic)
+        if m:
+            return m.groupdict()
+        return None
+
+    def _slack_invite(self, channel_id):
+        self.slack_api(
+            'channels.invite',
+            {
+                'channel': channel_id,
+                'user': self.slack_own_user_id,
+            },
+            headers=self.slack_user_token_header,
+        )
 
     def irc_disconnect(self, conn, event):
         # Throw control back to irc_connect
-        raise IRCDisconnection()
+        raise Disconnection()
 
     def irc_message(self, conn, event):
         if not self.slack_ws:
+            log.debug(f'Ignoring IRC message because Slack is not yet connected')
             return
 
-        irc_conf = self.irc_conn_to_conf[conn]
+        irc_server = self.irc_server_by_conn[conn]
 
+        # Contextual text transformations
         text = event.arguments[0]
         if event.type == 'action':
             text = '_' + text + '_'
-
-        is_public = event.target.startswith('#')
-
-        channel_name = None
-        if is_public:
-            if event.target in irc_conf['channels']:
-                channel_name = irc_conf['channels'][event.target][1:]
-        else:
-            if event.source.nick in irc_conf['channels']:
-                channel_name = irc_conf['channels'][event.source.nick][1:]
-            # Control message?
-            elif event.source.nick.startswith('*'):
-                self.slack_error("Message from internal {}: {}".format(
-                    event.source.nick,
-                    reformat_irc(text),
-                ))
-                return
-            else:
-                # Time to create channel!
-                channel_name = f'dm-{event.source.nick.lower()[:18]}'
-
-                if channel_name in self.slack_channel_name_to_id:
-                    log.error('Tried to create a DM channel for %s, but %s already exists and is configured for something else', event.source.nick, channel_name)
-                    self.slack_error(f'Tried to create a DM channel for {event.source.nick}, but {channel_name} already exists and is configured for something else')
-                    return
-
-                resp = self.slack_api(
-                    'channels.create',
-                    {
-                        'name': channel_name,
-                        'validate': True,
-                    },
-                    headers=self.slack_user_token_header,
-                )
-                if not resp['ok']:
-                    log.error('Error from Slack API: %s', resp)
-                    self.slack_error(f'Error from Slack API: ```{resp}```')
-                    return
-
-                channel_id = resp['channel']['id']
-                self.slack_channel_name_to_id[channel_name] = channel_id
-                self.slack_channel_id_to_name[channel_id] = channel_name
-
-                resp = self.slack_api(
-                    'channels.invite',
-                    {
-                        'channel': channel_id,
-                        'user': self.slack_own_user_id,
-                    },
-                    headers=self.slack_user_token_header,
-                )
-                if not resp['ok']:
-                    log.error('Error from Slack API: %s', resp)
-                    self.slack_error(f'Error from Slack API: ```{resp}```')
-                    return
-
-                resp = self.slack_api(
-                    'channels.setTopic',
-                    {
-                        'channel': channel_id,
-                        'topic': f'{irc_conf["name"]}/{event.source.nick.lower()}'
-                    },
-                    headers=self.slack_user_token_header,
-                )
-                if not resp['ok']:
-                    log.error('Error from Slack API: %s', resp)
-                    self.slack_error(f'Error from Slack API: ```{resp}```')
-                    return
-
-                # For some reason, only url params are allowed on this one.
-                self.slack_api('users.prefs.setNotifications?' + urlencode({
-                    'channel_id': channel_id,
-                    'name': 'desktop',
-                    'value': 'everything',
-                    'global': 0,
-                }), headers=self.slack_user_token_header)
-                if not resp['ok']:
-                    log.error('Error from Slack API: %s', resp)
-                    self.slack_error(f'Error from Slack API: ```{resp}```')
-                    return
-
-                self.slack_api('users.prefs.setNotifications?' + urlencode({
-                    'channel_id': channel_id,
-                    'name': 'mobile',
-                    'value': 'everything',
-                    'global': 0,
-                }), headers=self.slack_user_token_header)
-                if not resp['ok']:
-                    log.error('Error from Slack API: %s', resp)
-                    self.slack_error(f'Error from Slack API: ```{resp}```')
-                    return
-
-                self.slack_channel_to_irc['#' + channel_name] = (conn, event.source.nick)
-                # Not entirely correct...
-                irc_conf['channels'][event.source.nick] = '#' + channel_name
-
-        if not channel_name:
-            log.error('%s not configured for slack, ignoring', event.target)
-            return
-
         nick = event.source.nick
-        if event.source.nick in irc_conf.get('deprefix', []):
+        if event.source.nick in irc_server.conf.get('deprefix', []):
             m = re.match(r'<([^>]+)> (.*)', text)
             if m:
                 nick = m[1]
                 text = m[2]
+
+        if event.source.nick.startswith('*'):
+            self.slack_error("Message from internal {}: {}".format(
+                event.source.nick,
+                reformat_irc(text),
+            ))
+            return
+
+        is_public = event.target.startswith('#')
+
+        slack_channel_name = None
+        peer = None
+        if is_public:
+            peer = event.target
+        else:
+            peer = event.source.nick
+
+        full_name = IRCChannel.get_full_name(
+            irc_server.conf['name'],
+            peer,
+        )
+        log.debug(f'Looking for bridge for {full_name}')
+        bridge = self.bridge_by_irc_full_name.get(full_name)
+
+        if bridge:
+            log.debug(f'Found bridge {bridge}')
+            slack_channel_name = bridge.slack_channel[1:]
+        elif not is_public:
+            # Time to create channel!
+            slack_channel_name = f'dm-{event.source.nick.lower()[:18]}'
+
+            if self.slack_channel_by_name.get(slack_channel_name):
+                log.error('Tried to create a DM channel for %s, but %s already exists and is configured for something else', event.source.nick, slack_channel_name)
+                self.slack_error(f'Tried to create a DM channel for {event.source.nick}, but {slack_channel_name} already exists and is configured for something else')
+                return
+
+            log.debug(f'Creating DM channel {slack_channel_name}')
+
+            resp = self.slack_api(
+                'channels.create',
+                {
+                    'name': slack_channel_name,
+                    'validate': True,
+                },
+                headers=self.slack_user_token_header,
+            )
+            if not resp['ok']:
+                return
+
+            channel = resp['channel']
+            self.slack_channels.append(channel)
+
+            resp = self.slack_api(
+                'channels.setTopic',
+                {
+                    'channel': channel['id'],
+                    'topic': f'{irc_server.conf["name"]}/{event.source.nick.lower()}'
+                },
+                headers=self.slack_user_token_header,
+            )
+            if not resp['ok']:
+                return
+
+            # We will receive a channel_topic event. Complete the bridge registration there, in slack_message
+
+            # Invite after configuring otherwise we will complain about getting a join message from the real user for a channel not yet configured.
+            self._slack_invite(channel['id'])
+
+        if not slack_channel_name:
+            log.error('%s not configured for slack, ignoring', event.target)
+            return
 
         # Can't impersonate user from RTM API, have to use postMessage.
         self.slack_api(
@@ -337,9 +394,9 @@ class Kari:
             {
                 'username': nick,
                 'text': reformat_irc(text),
-                'channel': self.slack_channel_name_to_id[channel_name],
+                'channel': self.slack_channel_by_name[slack_channel_name]['id'],
                 'icon_url': self.irc_username_to_slack_avatar.get(
-                    irc_conf.get('users', {}).get(
+                    irc_server.conf.get('users', {}).get(
                         nick
                     ) or nick.lower(),
                     f'https://www.gravatar.com/avatar/{md5(nick.lower().encode("utf-8")).hexdigest()}?d=retro&s=1024',
@@ -352,7 +409,7 @@ class Kari:
             "chat.postMessage",
             {
                 'text': error_msg,
-                'channel': self.slack_error_channel,
+                'channel': self.slack_error_channel_id,
             }
         )
 
@@ -387,25 +444,33 @@ class Kari:
 
         if type_ == 'message':
             # Error channel?
-            if msg['channel'] == self.slack_error_channel:
+            if msg['channel'] == self.slack_error_channel_id:
                 return
 
-            channel_name = '#' + self.slack_channel_id_to_name[msg['channel']]
+            slack_channel_name = '#' + self.slack_channel_by_id[msg['channel']]['name']
+            bridge = self.bridge_by_slack_channel.get(slack_channel_name)
 
             # Slack-only channel?
-            if channel_name not in self.slack_channel_to_irc and subtype != 'channel_topic':
-                log.error('%s not configured for irc, ignoring', channel_name)
-                self.slack_error(f'{channel_name} not configured for irc, ignoring')
-                return
-
-            irc_conn, irc_channel = self.slack_channel_to_irc.get(channel_name) or (None, None)
+            # If it's a channel_topic, we could be reconfiguring a PM room
+            if not bridge:
+                if subtype == 'channel_topic':
+                    irc_conn = None
+                    irc_channel_name = None
+                else:
+                    log.error('%s not configured for irc, ignoring', slack_channel_name)
+                    self.slack_error(f'{slack_channel_name} not configured for irc, ignoring')
+                    return
+            else:
+                irc_conn = bridge.irc_channel.server.conn
+                irc_channel_name = bridge.irc_channel.name
 
             if subtype is None:
+                # Normal message
                 if 'files' in msg:
                     for file in msg['files']:
                         threading.Thread(
                             target=self.mirror_upload,
-                            args=(msg['channel'], msg['ts'], irc_conn, irc_channel, file['url_private']),
+                            args=(msg['channel'], msg['ts'], irc_conn, irc_channel_name, file['url_private']),
                             daemon=True,
                         ).start()
 
@@ -419,7 +484,7 @@ class Kari:
                             quoting_format = get_quoting_format(attachment.get('msg_subtype'))
                             # No author_id if bot
                             if 'author_id' in attachment:
-                                nick = self.slack_user_id_to_name[attachment['author_id']]
+                                nick = self.slack_user_by_id[attachment['author_id']]['name']
                             else:
                                 nick = attachment['author_subname']
 
@@ -428,7 +493,7 @@ class Kari:
                                 for line in attachment['text'].split('\n')
                             )
 
-                            privmsg(irc_conn, irc_channel, text, should_reformat=False)
+                            privmsg(irc_conn, irc_channel_name, text, should_reformat=False)
 
                 # We want to post any shares before the text we're commenting on them with
                 if 'text' in msg and msg['text'] != '':
@@ -437,12 +502,10 @@ class Kari:
                         # Saving ourselves for the message_replied.
                         self.slack_pending_thread_reply = msg
                         return
-                    # Yes, sending this inline on a connection being polled
-                    # by another thread.
-                    privmsg(irc_conn, irc_channel, msg['text'])
+                    privmsg(irc_conn, irc_channel_name, msg['text'])
 
             elif subtype == 'me_message':
-                irc_conn.action(irc_channel, emojize(msg['text']))
+                irc_conn.action(irc_channel_name, emojize(msg['text']))
             elif subtype == 'message_replied':
                 replies = sorted(msg['message']['replies'], key=lambda r: float(r['ts']))
 
@@ -469,7 +532,7 @@ class Kari:
                         if quoting_format:
                             privmsg(
                                 irc_conn,
-                                irc_channel,
+                                irc_channel_name,
                                 quoting_format.format(
                                     nick=nick,
                                     message=reformat_slack(msg['message']['text']),
@@ -477,57 +540,83 @@ class Kari:
                                 should_reformat=False,
                             )
 
-                privmsg(irc_conn, irc_channel, self.slack_pending_thread_reply['text'])
+                privmsg(irc_conn, irc_channel_name, self.slack_pending_thread_reply['text'])
                 self.slack_pending_thread_reply = None
             elif subtype == 'channel_topic':
                 log.info('Channel topic changed event: %s', msg)
 
                 # Is this a PM bridge?
-                if irc_channel and irc_channel.startswith('#'):
+                if irc_channel_name and irc_channel_name.startswith('#'):
                     return
 
                 # Deregister old mapping if there is any
-                if channel_name in self.slack_channel_to_irc:
-                    log.info('Removing mapping between Slack %s and IRC %s', channel_name, irc_channel)
-                    del self.slack_channel_to_irc[channel_name]
-                    del self.irc_conn_to_conf[irc_conn]['channels'][irc_channel]
+                if bridge:
+                    log.info('Removing mapping between Slack %s and IRC %s', slack_channel_name, irc_channel_name)
+                    self.bridges.remove(bridge)
 
                 # Register new mapping if any
-                new_topic = msg['topic']
-                if '/' in new_topic:
-                    network, target = new_topic.split('/', 1)
+                pm_config = self._extract_pm_config(msg['topic'])
+                if pm_config:
+                    irc_server = self.irc_server_by_name.get(pm_config['server'])
 
-                    if network not in self.irc_conf_name_to_conn:
-                        log.error('Nonexistent network specified in Slack channel topic: %s on %s', network, channel_name)
+                    if not irc_server:
+                        log.error('Nonexistent server specified in Slack channel topic: %s to configure %s', pm_config['server'], slack_channel_name)
                         return
 
-                    log.info('Adding mapping between Slack %s and IRC %s', channel_name, target)
-                    self.slack_channel_to_irc[channel_name] = (
-                        self.irc_conf_name_to_conn[network],
-                        target,
-                    )
-                    self.irc_conn_to_conf[self.irc_conf_name_to_conn[network]]['channels'][target] = channel_name
+                    log.info('Adding mapping between Slack %s and IRC %s', slack_channel_name, pm_config['target'])
+                    irc_channel = IRCChannel(name=pm_config['target'], server=irc_server)
+                    bridge = Bridge(slack_channel=slack_channel_name, irc_channel=irc_channel)
 
+                    self.bridges.append(bridge)
+        elif type_ == 'channel_joined':
+            log.info('Channel joined event: %s', msg)
+            slack_channel_name = '#' + self.slack_channel_by_id[msg['channel']['id']]['name']
+
+            # Register new mapping if any
+            pm_config = self._extract_pm_config(msg['channel']['topic']['value'])
+            if pm_config:
+                irc_server = self.irc_server_by_name.get(pm_config['server'])
+
+                if not irc_server:
+                    log.error('Nonexistent server specified in Slack channel topic: %s to configure %s', pm_config['server'], slack_channel_name)
+                    return
+
+                log.info('Adding mapping between Slack %s and IRC %s', slack_channel_name, pm_config['target'])
+                irc_channel = IRCChannel(name=pm_config['target'], server=irc_server)
+                bridge = Bridge(slack_channel=slack_channel_name, irc_channel=irc_channel)
+
+                self.bridges.append(bridge)
         elif type_ == 'channel_created':
             log.info('Channel created event: %s', msg)
-            new_channel = msg['channel']
-            self.slack_channel_name_to_id[new_channel['name']] = new_channel['id']
-            self.slack_channel_id_to_name[new_channel['id']] = new_channel['name']
+            self.slack_channels.append(msg['channel'])
+        elif type_ == 'channel_rename':
+            log.info('Channel renamed event: %s', msg)
+
+            slack_channel_name = '#' + self.slack_channel_by_id[msg['channel']['id']]['name']
+            bridge = self.bridge_by_slack_channel.get(slack_channel_name)
+            if bridge:
+                log.debug(f'Renaming bridge {bridge}')
+                bridge.slack_channel = '#' + msg['channel']['name']
+                self.bridge_by_slack_channel.refresh()
+
+            self.slack_channel_by_id[msg['channel']['id']]['name'] = msg['channel']['name']
+            self.slack_channel_by_name.refresh()
         elif type_ == 'channel_deleted':
             log.info('Channel deleted event: %s', msg)
-            channel_name = self.slack_channel_id_to_name.pop(msg['channel'])
-            del self.slack_channel_name_to_id[channel_name]
 
-            channel_name = '#' + channel_name
-            if channel_name in self.slack_channel_to_irc:
-                irc_conn, _ = self.slack_channel_to_irc.pop(channel_name)
-                irc_conf = self.irc_conn_to_conf[irc_conn]
-                del irc_conf['channels'][
-                    list(irc_conf['channels'].keys())[list(irc_conf['channels'].values()).index(channel_name)]
-                ]
+            slack_channel_name = '#' + self.slack_channel_by_id[msg['channel']]['name']
+            bridge = self.bridge_by_slack_channel.get(slack_channel_name)
+            if bridge:
+                log.debug(f'Removing bridge {bridge}')
+                self.bridges.remove(bridge)
+
+            self.slack_channels.remove(
+                self.slack_channel_by_id[msg['channel']]
+            )
         elif type_ == 'goodbye':
-            # XXX: Add reconnection logic
-            pass
+            log.error('Wild goodbye spotted: %s', msg)
+            self.slack_error(f'`goodbye` from Slack stream: ```{msg}```')
+            raise Disconnection()
         elif type_ == 'error':
             log.error('Error from Slack stream: %s', msg)
             self.slack_error(f'Error from Slack stream: ```{msg}```')
@@ -642,6 +731,8 @@ def privmsg(irc_conn, irc_channel, msg, should_reformat=True):
 
 
 if __name__ == '__main__':
+    # irc...
+    logging.addLevelName(8, 'DEBUG')
     logging.basicConfig(
         format='[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s',
         level=0,

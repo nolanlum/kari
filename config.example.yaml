@@ -1,0 +1,46 @@
+---
+# Configuration for the single Slack workspace
+slack:
+  # The bot's own username
+  username: shell
+  # Bot token, used for most operations
+  # Configure this token to have channel:write scope.
+  token: xoxb-your-token
+  # User token, used for creating DM bridge channels. Use your legacy custom token, not the bot's OAuth token.
+  user_token: xoxp-your-token
+  # A token for a donor workspace used to provide avatars.
+  avatar_pilfering_token: xoxp-your-token
+  # Channel to write error messages to
+  errors: '#errors'
+  # The puu.sh-compatible file host for mirroring uploads to
+  file_mirror:
+    host: https://yourhost.com/upload
+    key: your-upload-key
+
+irc:
+  # Configure one IRC connection to bridge to
+  - name: rizon
+    hostname: localhost
+    port: 6697
+    nickname: your-nick
+    password: your-server-password
+    ssl: true
+    channels:
+      '#channel-name-in-irc': '#channel-name-in-slack'
+    # This dictionary maps IRC names to Slack names in the workspace
+    # the avatar_pilfering_token belongs to
+    users:
+      'ircdude': 'slackdude'
+  # And configure another!
+  - name: other-rizon
+    hostname: localhost
+    port: 6697
+    nickname: your-other-nick
+    password: your-server-password
+    ssl: true
+    channels:
+      '#other-channel': '#other-channel'
+    # List of users for which messages from them should have a <user> prefix removed
+    # and used as the actual author. (read: bridge bots)
+    deprefix:
+      - H-tan
