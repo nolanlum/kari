@@ -102,7 +102,6 @@ class Kari:
 
         self._init_error_channel(config['slack']['errors'][1:])
 
-        self.slack_pending_thread_reply = None
         self.slack_ws = None
 
         self.bridges = KeyViewList()
@@ -462,7 +461,7 @@ class Kari:
                 irc_conn = bridge.irc_channel.server.conn
                 irc_channel_name = bridge.irc_channel.name
 
-            if subtype is None:
+            if subtype in ('thread_broadcast', None):
                 # Normal message
                 if 'files' in msg:
                     for file in msg['files']:
@@ -495,11 +494,6 @@ class Kari:
 
                 # We want to post any shares before the text we're commenting on them with
                 if 'text' in msg and msg['text'] != '':
-                    # Is this a thread reply?
-                    if 'thread_ts' in msg:
-                        # Saving ourselves for the message_replied.
-                        self.slack_pending_thread_reply = msg
-                        return
                     privmsg(irc_conn, irc_channel_name, msg['text'])
 
             elif subtype == 'me_message':
@@ -507,21 +501,11 @@ class Kari:
             elif subtype == 'message_replied':
                 replies = sorted(msg['message']['replies'], key=lambda r: float(r['ts']))
 
-                # This is pretty unlikely to happen, these events are usually sent back to back
-                if not self.slack_pending_thread_reply:
-                    # Although it will happen regularly when pshuu_mirror operates.
-                    # Do a hacky thing to see if the last reply (the one we're expecting details for) was from
-                    # a bot, in which case we will have just ignored because the subtype is bot_message
-                    if not replies[-1]['user'].startswith('B'):
-                        log.error('Got a message_replied but no pending reply, skipping: %s', json.dumps(msg, indent=4))
-                        self.slack_error(f'Got a `message_replied` but no pending reply, skipping: ```{json.dumps(msg, indent=4)}```')
-                    return
-
                 # Only quotepost on the first reply or if a period of time has passed.
                 if len(replies) == 1 or time.time() - float(replies[-2]['ts']) > 3600:  # 1 hour
                     # Now here is some duplication of logic.
                     # XXX: This will cause a Slack-side image upload reply to not be quoteposted
-                    nick = self.slack_user_id_to_name.get(msg['message']['user']) if 'user' in msg['message'] else msg['message']['username']
+                    nick = self.slack_user_by_id.get(msg['message']['user'])['name'] if 'user' in msg['message'] else msg['message']['username']
 
                     quoting_format = get_quoting_format(msg['message'].get('subtype'))
 
@@ -537,9 +521,6 @@ class Kari:
                                 ),
                                 should_reformat=False,
                             )
-
-                privmsg(irc_conn, irc_channel_name, self.slack_pending_thread_reply['text'])
-                self.slack_pending_thread_reply = None
             elif subtype == 'channel_topic':
                 log.info('Channel topic changed event: %s', msg)
 
@@ -566,6 +547,10 @@ class Kari:
                     bridge = Bridge(slack_channel=slack_channel_name, irc_channel=irc_channel)
 
                     self.bridges.append(bridge)
+            elif subtype in ('bot_message',):
+                pass
+            else:
+                log.debug(f'Not handling message event subtype {subtype}')
         elif type_ == 'channel_joined':
             log.info('Channel joined event: %s', msg)
             slack_channel_name = '#' + self.slack_channel_by_id[msg['channel']['id']]['name']
@@ -612,12 +597,14 @@ class Kari:
                 self.slack_channel_by_id[msg['channel']]
             )
         elif type_ == 'goodbye':
-            log.error('Wild goodbye spotted: %s', msg)
-            self.slack_error(f'`goodbye` from Slack stream: ```{msg}```')
             raise Disconnection()
         elif type_ == 'error':
             log.error('Error from Slack stream: %s', msg)
             self.slack_error(f'Error from Slack stream: ```{msg}```')
+        elif type_ in ('hello',):
+            pass
+        else:
+            log.debug(f"Don't know Not handling event type {type_}")
 
 
 def apply_span(msg, span, md_char):
@@ -680,6 +667,8 @@ def reformat_irc(msg):
     # Strictly speaking, there are a few cases where this is not necessary.
     for span in tilde_spans:
         begin, end = span
+        if not (begin and end):
+            break
         msg[begin] = '\u200b~'
         msg[end] = '~\u200b'
 
