@@ -661,17 +661,6 @@ def reformat_irc(msg):
     for span in italic_spans:
         apply_span(msg, span, '_')
 
-    tilde_idxs = (m.start() for m in re.finditer('~', orig_msg))
-    tilde_spans = zip_longest(*[iter(tilde_idxs)] * 2)
-
-    # Strictly speaking, there are a few cases where this is not necessary.
-    for span in tilde_spans:
-        begin, end = span
-        if not (begin and end):
-            break
-        msg[begin] = '\u200b~'
-        msg[end] = '~\u200b'
-
     return ''.join(msg)
 
 
