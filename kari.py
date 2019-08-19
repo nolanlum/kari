@@ -244,11 +244,13 @@ class Kari:
                     self.slack_error(f'Exception calling rtm.connect: {ex}, reconnecting')
                 except requests.exceptions.HTTPError as ex2:
                     log.error(f'Exception reporting exception: {ex2}')
+                break
             except Exception as ex:
                 log.error(f'Last resort Exception calling rtm.connect: {ex}, reconnecting')
                 exc_text = traceback.format_exc()
                 print(exc_text)
                 self.slack_error(f'Last resort Exception calling rtm.connect: {ex}, reconnecting\n```{exc_text}```')
+                break
 
             try:
                 async with websockets.connect(resp['url'], ping_interval=60.0) as ws:
@@ -604,7 +606,7 @@ class Kari:
         elif type_ in ('hello',):
             pass
         else:
-            log.debug(f"Don't know Not handling event type {type_}")
+            log.debug(f"Not handling event type {type_}")
 
 
 def apply_span(msg, span, md_char):
@@ -711,8 +713,17 @@ def privmsg(irc_conn, irc_channel, msg, should_reformat=True):
         msg = reformat_slack(msg)
     msgs = msg.split('\n')
 
+    bytes_available = 512 - len('PRIVMSG {} :\r\n'.format(irc_channel))
     for msg in msgs:
-        irc_conn.privmsg(irc_channel, msg)
+        msg_bytes = irc_conn.encode(msg)
+
+        while len(msg_bytes) > bytes_available:
+            space_idx = msg_bytes.rfind(b' ', 0, bytes_available)
+            fragment = msg_bytes[:space_idx]
+            msg_bytes = msg_bytes[space_idx + 1:]
+            irc_conn.privmsg(irc_channel, fragment.decode(irc_conn.transmit_encoding))
+        irc_conn.privmsg(irc_channel, msg_bytes.decode(irc_conn.transmit_encoding))
+
 
 
 if __name__ == '__main__':
