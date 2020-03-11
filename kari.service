@@ -1,0 +1,14 @@
+[Unit]
+Description=Bridge between Slack and IRC
+Wants=network-online.target znc.service
+After=network-online.target znc.service
+
+[Service]
+Type=simple
+ExecStart=/bin/sh -c 'cd ${INSTALLDIR} && exec venv/bin/python kari.py'
+Restart=on-failure
+RestartSec=5
+StartLimitInterval=0
+
+[Install]
+WantedBy=default.target
