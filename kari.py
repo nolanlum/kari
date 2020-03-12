@@ -4,7 +4,6 @@ import logging
 import os
 import re
 import select
-import signal
 import socket
 import ssl
 import string
@@ -177,7 +176,7 @@ class Kari:
 
     def thread_bomb(self, target):
         target.join()
-        os.kill(os.getpid(), signal.SIGTERM)
+        os._exit(1)
 
     def slack_api(self, endpoint, params=None, headers=None):
         before = time.time()
