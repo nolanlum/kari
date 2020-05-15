@@ -208,35 +208,36 @@ class Kari:
         return resp
 
     def irc_connect(self, config):
+        # XXX: Backoff on failures?
         while True:
             reactor = irc.client.Reactor()
 
-            for irc_server in self.irc_servers:
-                irc_server.conn = reactor.server().connect(
-                    server=irc_server.conf['hostname'],
-                    port=int(irc_server.conf['port']),
-                    nickname=irc_server.conf['nickname'],
-                    password=irc_server.conf['password'],
-                    connect_factory=irc.connection.Factory(
-                        wrapper=ssl.wrap_socket if irc_server.conf['ssl'] else lambda x: x
-                    ),
-                )
-
-            # Necessary because the view key is conn which we just assigned to
-            self.irc_servers.refresh()
-
-            reactor.add_global_handler('pubmsg', self.irc_message)
-            reactor.add_global_handler('privmsg', self.irc_message)
-            reactor.add_global_handler('action', self.irc_message)
-            # reactor will actually not stop for this by default, if the server says it's over,
-            # reactor will just continue processing an empty list of sockets.
-            reactor.add_global_handler('disconnect', self.irc_disconnect)
-
             try:
+                for irc_server in self.irc_servers:
+                    irc_server.conn = reactor.server().connect(
+                        server=irc_server.conf['hostname'],
+                        port=int(irc_server.conf['port']),
+                        nickname=irc_server.conf['nickname'],
+                        password=irc_server.conf['password'],
+                        connect_factory=irc.connection.Factory(
+                            wrapper=ssl.wrap_socket if irc_server.conf['ssl'] else lambda x: x
+                        ),
+                    )
+
+                # Necessary because the view key is conn which we just assigned to
+                self.irc_servers.refresh()
+
+                reactor.add_global_handler('pubmsg', self.irc_message)
+                reactor.add_global_handler('privmsg', self.irc_message)
+                reactor.add_global_handler('action', self.irc_message)
+                # reactor will actually not stop for this by default, if the server says it's over,
+                # reactor will just continue processing an empty list of sockets.
+                reactor.add_global_handler('disconnect', self.irc_disconnect)
+
                 # No reason to poll so hard, we should believe select(3) works.
                 reactor.process_forever(timeout=60.0)
             except (select.error, Disconnection) as ex:
-                log.error(f'Received exception from irc: {str(ex)}, reconnecting')
+                log.error(f'Received exception from irc: {ex}: {str(ex)}, reconnecting')
                 for sock in reactor.sockets:
                     sock.shutdown(socket.SHUT_RDWR)
                     sock.close()
@@ -304,6 +305,7 @@ class Kari:
 
     def irc_disconnect(self, conn, event):
         # Throw control back to irc_connect
+        log.debug('Got disconnect event, raising exception')
         raise Disconnection()
 
     def irc_message(self, conn, event):
