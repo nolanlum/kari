@@ -1,3 +1,4 @@
+import functools
 import html
 import json
 import logging
@@ -28,6 +29,9 @@ from key_view import KeyViewList
 
 
 LETTERS_NUMBERS = string.ascii_letters + string.digits
+
+REQUEST_TIMEOUT = 10
+UPLOAD_REQUEST_TIMEOUT = 60
 
 
 log = logging.getLogger('kari')
@@ -76,13 +80,18 @@ class Kari:
 
         # Set up Slack
         resp = requests.post(
-            'https://slack.com/api/users.list', headers={'Authorization': f"Bearer {config['slack']['avatar_pilfering_token']}"}
+            'https://slack.com/api/users.list',
+            headers={'Authorization': f"Bearer {config['slack']['avatar_pilfering_token']}"},
+            timeout=REQUEST_TIMEOUT,
         ).json()
 
         self.irc_username_to_slack_avatar = {u['name']: u['profile']['image_512'] for u in resp['members']}
 
         # Slack client doesn't uses sessions -> keepalive, just use requests.
         self.slack_session = requests.Session()
+        # Oh, Requests...
+        self.slack_session.request = functools.partial(self.slack_session.request, timeout=REQUEST_TIMEOUT)
+
         self.slack_session.headers.update({
             'Authorization': f"Bearer {config['slack']['token']}"
         })
@@ -420,6 +429,7 @@ class Kari:
             self.mirror_conf['host'],
             data={'k': self.mirror_conf['key']},
             files={'f': (basename(slack_url), BytesIO(resp.content), resp.headers['Content-Type'])},
+            timeout=UPLOAD_REQUEST_TIMEOUT,
         ).json()
 
         irc_conn.privmsg(irc_channel, resp['share_url'])
