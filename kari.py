@@ -408,8 +408,11 @@ class Kari:
                     irc_server.conf.get('users', {}).get(
                         nick
                     ) or nick.lower(),
-                    f'https://www.gravatar.com/avatar/{md5(nick.lower().encode("utf-8")).hexdigest()}?d=retro&s=1024',
+                    f'https://avatars.dicebear.com/api/personas/{md5(nick.lower().encode("utf-8")).hexdigest()}',
                 ),
+                'unfurl_links': True,
+                'unfurl_media': True,
+                'parse': 'full',
             }
         )
 
