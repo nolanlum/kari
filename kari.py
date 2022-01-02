@@ -477,8 +477,13 @@ class Kari:
                 irc_conn = bridge.irc_channel.server.conn
                 irc_channel_name = bridge.irc_channel.name
 
-            if subtype in ('thread_broadcast', None):
+            if subtype in ('message_replied', 'thread_broadcast', None):
                 # Normal message
+
+                # TODO: For non-broadcast replies, fetch the other replies from Slack, they aren't sent with this message any more
+                # TODO: Only quotepost on the first reply or if a period of time has passed.
+
+                # We want to post any shares before the text we're commenting on them with
                 if 'files' in msg:
                     for file in msg['files']:
                         threading.Thread(
@@ -508,35 +513,12 @@ class Kari:
 
                             privmsg(irc_conn, irc_channel_name, text, should_reformat=False)
 
-                # We want to post any shares before the text we're commenting on them with
+                # Now send the actual message
                 if 'text' in msg and msg['text'] != '':
                     privmsg(irc_conn, irc_channel_name, msg['text'])
 
             elif subtype == 'me_message':
                 irc_conn.action(irc_channel_name, emojize(msg['text']))
-            elif subtype == 'message_replied':
-                replies = sorted(msg['message']['replies'], key=lambda r: float(r['ts']))
-
-                # Only quotepost on the first reply or if a period of time has passed.
-                if len(replies) == 1 or time.time() - float(replies[-2]['ts']) > 3600:  # 1 hour
-                    # Now here is some duplication of logic.
-                    # XXX: This will cause a Slack-side image upload reply to not be quoteposted
-                    nick = self.slack_user_by_id.get(msg['message']['user'])['name'] if 'user' in msg['message'] else msg['message']['username']
-
-                    quoting_format = get_quoting_format(msg['message'].get('subtype'))
-
-                    # XXX: We aren't rendering attachments of the thread root. Guess that's okay...
-                    if 'text' in msg['message'] and msg['message']['text'] != '':
-                        if quoting_format:
-                            privmsg(
-                                irc_conn,
-                                irc_channel_name,
-                                quoting_format.format(
-                                    nick=nick,
-                                    message=reformat_slack(msg['message']['text']),
-                                ),
-                                should_reformat=False,
-                            )
             elif subtype == 'channel_topic':
                 log.info('Channel topic changed event: %s', msg)
 
@@ -676,6 +658,8 @@ def reformat_irc(msg):
 
     for span in italic_spans:
         apply_span(msg, span, '_')
+
+    # TODO: strip color formatting
 
     return ''.join(msg)
 
