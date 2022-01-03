@@ -408,7 +408,7 @@ class Kari:
                     irc_server.conf.get('users', {}).get(
                         nick
                     ) or nick.lower(),
-                    f'https://avatars.dicebear.com/api/personas/{md5(nick.lower().encode("utf-8")).hexdigest()}',
+                    f'https://avatars.dicebear.com/api/personas/{md5(nick.lower().encode("utf-8")).hexdigest()}.png',
                 ),
                 'unfurl_links': True,
                 'unfurl_media': True,
