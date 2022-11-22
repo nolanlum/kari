@@ -24,6 +24,8 @@ import websockets
 import irc.client
 import yaml
 import emoji
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from key_view import KeyViewList
 
@@ -91,6 +93,14 @@ class Kari:
         self.slack_session = requests.Session()
         # Oh, Requests...
         self.slack_session.request = functools.partial(self.slack_session.request, timeout=REQUEST_TIMEOUT)
+        adapter = HTTPAdapter(max_retries=Retry(
+            total=3,
+            backoff_factor=0.1,
+            allowed_methods=None,
+        ))
+
+        self.slack_session.mount('http://', adapter)
+        self.slack_session.mount('https://', adapter)
 
         self.slack_session.headers.update({
             'Authorization': f"Bearer {config['slack']['token']}"
