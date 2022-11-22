@@ -262,7 +262,7 @@ class Kari:
                 break
 
             try:
-                async with websockets.connect(resp['url'], ping_interval=60.0) as ws:
+                async with websockets.connect(resp['url']) as ws:
                     self.slack_ws = ws
                     while True:
                         msg = await ws.recv()
