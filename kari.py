@@ -437,7 +437,6 @@ class Kari:
             timeout=UPLOAD_REQUEST_TIMEOUT,
         ).json()
 
-        irc_conn.privmsg(irc_channel, resp['share_url'])
         self.slack_api(
             "chat.postMessage",
             {
@@ -690,7 +689,7 @@ def delink(match):
 
 
 def emojize(msg):
-    return emoji.emojize(msg, use_aliases=True)
+    return emoji.emojize(msg, language='alias')
 
 
 def reformat_slack(msg):
