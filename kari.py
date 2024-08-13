@@ -224,14 +224,19 @@ class Kari:
 
             try:
                 for irc_server in self.irc_servers:
+                    if irc_server.conf['ssl']:
+                        ssl_ctx = ssl.create_default_context()
+                        ssl_ctx.check_hostname = False
+                        wrapper = functools.partial(ssl_ctx.wrap_socket, server_hostname=irc_server.conf['hostname'])
+                    else:
+                        def wrapper(x): return x
+
                     irc_server.conn = reactor.server().connect(
                         server=irc_server.conf['hostname'],
                         port=int(irc_server.conf['port']),
                         nickname=irc_server.conf['nickname'],
                         password=irc_server.conf['password'],
-                        connect_factory=irc.connection.Factory(
-                            wrapper=ssl.wrap_socket if irc_server.conf['ssl'] else lambda x: x
-                        ),
+                        connect_factory=irc.connection.Factory(wrapper=wrapper),
                     )
 
                 # Necessary because the view key is conn which we just assigned to
@@ -248,6 +253,7 @@ class Kari:
                 reactor.process_forever(timeout=60.0)
             except (select.error, Disconnection) as ex:
                 log.error(f'Received exception from irc: {ex}: {str(ex)}, reconnecting')
+
                 for sock in reactor.sockets:
                     sock.shutdown(socket.SHUT_RDWR)
                     sock.close()
@@ -305,10 +311,10 @@ class Kari:
 
     def _slack_invite(self, channel_id):
         self.slack_api(
-            'channels.invite',
+            'conversations.invite',
             {
                 'channel': channel_id,
-                'user': self.slack_own_user_id,
+                'users': self.slack_own_user_id,
             },
             headers=self.slack_user_token_header,
         )
@@ -374,7 +380,7 @@ class Kari:
             log.debug(f'Creating DM channel {slack_channel_name}')
 
             resp = self.slack_api(
-                'channels.create',
+                'conversations.create',
                 {
                     'name': slack_channel_name,
                     'validate': True,
@@ -388,7 +394,7 @@ class Kari:
             self.slack_channels.append(channel)
 
             resp = self.slack_api(
-                'channels.setTopic',
+                'conversations.setTopic',
                 {
                     'channel': channel['id'],
                     'topic': f'{irc_server.conf["name"]}/{event.source.nick.lower()}'
@@ -730,7 +736,6 @@ def privmsg(irc_conn, irc_channel, msg, should_reformat=True):
             msg_bytes = msg_bytes[space_idx + 1:]
             irc_conn.privmsg(irc_channel, fragment.decode(irc_conn.transmit_encoding))
         irc_conn.privmsg(irc_channel, msg_bytes.decode(irc_conn.transmit_encoding))
-
 
 
 if __name__ == '__main__':
