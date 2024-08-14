@@ -326,7 +326,7 @@ class Kari:
 
     def irc_message(self, conn, event):
         if not self.slack_ws:
-            log.debug(f'Ignoring IRC message because Slack is not yet connected')
+            log.debug('Ignoring IRC message because Slack is not yet connected')
             return
 
         irc_server = self.irc_server_by_conn[conn]
@@ -507,26 +507,24 @@ class Kari:
                             daemon=True,
                         ).start()
 
-                # Very carefully only handle message shares
-                # On successive shares we won't get recursive message unfurls in API
-                # and neither in the real client. It could be looked into...
-                if 'attachments' in msg:
-                    for attachment in msg['attachments']:
-                        if attachment['is_share'] and attachment['is_msg_unfurl'] and 'text' in attachment:
-                            # No, I don't know why this field is called `msg_subtype`.
-                            quoting_format = get_quoting_format(attachment.get('msg_subtype'))
-                            # No author_id if bot
-                            if 'author_id' in attachment:
-                                nick = self.slack_user_by_id[attachment['author_id']]['name']
-                            else:
-                                nick = attachment['author_subname']
+                # Slack only provides 'root' for a thread broadcast message and
+                # provides nothing for message replies, so that sucks.
+                if 'root' in msg:
+                    root = msg['root']
+                    if 'type' in root and root['type'] == 'message':
+                        quoting_format = get_quoting_format(root.get('subtype'))
+                        # No user if bot
+                        if 'user' in root:
+                            nick = self.slack_user_by_id[root['user']]['name']
+                        else:
+                            nick = root['username']
 
-                            text = '\n'.join(
-                                quoting_format.format(nick=nick, message=reformat_slack(line))
-                                for line in attachment['text'].split('\n')
-                            )
+                        text = '\n'.join(
+                            quoting_format.format(nick=nick, message=reformat_slack(line))
+                            for line in root['text'].split('\n')
+                        )
 
-                            privmsg(irc_conn, irc_channel_name, text, should_reformat=False)
+                        privmsg(irc_conn, irc_channel_name, text, should_reformat=False)
 
                 # Now send the actual message
                 if 'text' in msg and msg['text'] != '':
