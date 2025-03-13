@@ -105,8 +105,8 @@ class Kari:
         self.slack_session.headers.update({
             'Authorization': f"Bearer {config['slack']['token']}"
         })
-        self.slack_user_token_header = {
-            'Authorization': f"Bearer {config['slack']['user_token']}"
+        self.slack_socket_token_header = {
+            'Authorization': f"Bearer {config['slack']['websocket_token']}"
         }
 
         self.slack_channels = KeyViewList(self.slack_api('conversations.list')['channels'])
@@ -116,6 +116,7 @@ class Kari:
         self.slack_channel_by_id = self.slack_channels.register_itemgetter('id')
 
         self.slack_own_user_id = [u['id'] for u in users if u['name'] == config['slack']['username']][0]
+        self.slack_real_user_id = [u['id'] for u in users if u['name'] == config['slack']['realuser_username']][0]
         self.slack_user_by_id = users.register_itemgetter('id')
 
         self._init_error_channel(config['slack']['errors'][1:])
@@ -150,7 +151,7 @@ class Kari:
             for irc_channel_name, slack_channel_name in irc_conf['channels'].items():
                 slack_channel = self.slack_channel_by_name[slack_channel_name[1:]]
                 if not slack_channel['is_member']:
-                    self._slack_invite(slack_channel['id'])
+                    self._slack_join(slack_channel['id'])
                 irc_channel = IRCChannel(name=irc_channel_name, server=irc_server)
                 bridge = Bridge(slack_channel=slack_channel_name, irc_channel=irc_channel)
                 log.debug(f'Setting up bridge: {bridge}')
@@ -160,7 +161,7 @@ class Kari:
             for irc_target_user_name, slack_channel_name in irc_server_to_pm_channels[irc_conf['name']]:
                 slack_channel = self.slack_channel_by_name[slack_channel_name[1:]]
                 if not slack_channel['is_member']:
-                    self._slack_invite(slack_channel['id'])
+                    self._slack_join(slack_channel['id'])
                 irc_channel = IRCChannel(name=irc_target_user_name, server=irc_server)
                 bridge = Bridge(slack_channel=slack_channel_name, irc_channel=irc_channel)
                 log.debug(f'Setting up bridge: {bridge}')
@@ -213,7 +214,7 @@ class Kari:
             log.error('Error received from Slack API: %s', resp)
             if endpoint != 'chat.postMessage':
                 # Hopefully no loops are created.
-                self.slack_error(f'Error from Slack API: ```{resp}```')
+                self.slack_error(f'Error from Slack API ({endpoint}): ```{resp}```')
 
         return resp
 
@@ -261,20 +262,23 @@ class Kari:
     async def slack_connect(self):
         while True:
             try:
-                resp = self.slack_api('rtm.connect')
+                resp = self.slack_api(
+                    'apps.connections.open',
+                    headers=self.slack_socket_token_header,
+                )
             except requests.exceptions.HTTPError as ex:
-                log.error(f'Exception calling rtm.connect: {ex}, reconnecting')
-                # Will this work if we had troubles with rtm.connect? No idea!
+                log.error(f'Exception calling apps.connections.open: {ex}, reconnecting')
+                # Will this work if we had troubles with apps.connections.open? No idea!
                 try:
-                    self.slack_error(f'Exception calling rtm.connect: {ex}, reconnecting')
+                    self.slack_error(f'Exception calling apps.connections.open: {ex}, reconnecting')
                 except requests.exceptions.HTTPError as ex2:
                     log.error(f'Exception reporting exception: {ex2}')
                 break
             except Exception as ex:
-                log.error(f'Last resort Exception calling rtm.connect: {ex}, reconnecting')
+                log.error(f'Last resort Exception calling apps.connections.open: {ex}, reconnecting')
                 exc_text = traceback.format_exc()
                 print(exc_text)
-                self.slack_error(f'Last resort Exception calling rtm.connect: {ex}, reconnecting\n```{exc_text}```')
+                self.slack_error(f'Last resort Exception calling apps.connections.open: {ex}, reconnecting\n```{exc_text}```')
                 break
 
             try:
@@ -283,7 +287,7 @@ class Kari:
                     while True:
                         msg = await ws.recv()
                         msg = json.loads(msg)
-                        self.slack_message(msg)
+                        await self.slack_event(msg)
             except Disconnection:
                 log.error('Slack remote wants to disconnect gracefully, reconnecting')
             except websockets.exceptions.ConnectionClosed as ex:
@@ -309,14 +313,16 @@ class Kari:
             return m.groupdict()
         return None
 
+    def _slack_join(self, channel_id):
+        self.slack_api('conversations.join', {'channel': channel_id})
+
     def _slack_invite(self, channel_id):
         self.slack_api(
             'conversations.invite',
             {
                 'channel': channel_id,
-                'users': self.slack_own_user_id,
+                'users': self.slack_real_user_id,
             },
-            headers=self.slack_user_token_header,
         )
 
     def irc_disconnect(self, conn, event):
@@ -385,7 +391,6 @@ class Kari:
                     'name': slack_channel_name,
                     'validate': True,
                 },
-                headers=self.slack_user_token_header,
             )
             if not resp['ok']:
                 return
@@ -399,7 +404,6 @@ class Kari:
                     'channel': channel['id'],
                     'topic': f'{irc_server.conf["name"]}/{event.source.nick.lower()}'
                 },
-                headers=self.slack_user_token_header,
             )
             if not resp['ok']:
                 return
@@ -465,6 +469,21 @@ class Kari:
                 'unfurl_media': False,
             }
         )
+
+    async def slack_event(self, msg):
+        type_ = msg.get('type')
+
+        if type_ == 'events_api' and msg['payload'].get('type') == 'event_callback':
+            # I love doubly enveloped messages
+            self.slack_message(msg['payload']['event'])
+        elif type_ == 'hello':
+            debug_info = msg['debug_info']
+            log.debug(f"Connected to {debug_info['host']}, connection should last {debug_info['approximate_connection_time']}s")
+        elif type_ == 'disconnect':
+            raise Disconnection()
+
+        if 'envelope_id' in msg:
+            await self.slack_ws.send(json.dumps({'envelope_id': msg['envelope_id']}))
 
     def slack_message(self, msg):
         type_ = msg.get('type')

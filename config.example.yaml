@@ -3,11 +3,14 @@
 slack:
   # The bot's own username. Lowercase.
   username: shell
+  # Your Slack username, will be invited to DM bridge channels
+  realuser_username: kari
   # Bot token, used for most operations
-  # Make sure this is a legacy bot token (with scope bot).
+  # Get this token by installing your created app to your workspace.
   token: xoxb-your-token
-  # User token, used for creating DM bridge channels. Use your auth.signin token, not the bot's OAuth token.
-  user_token: xoxs-your-token
+  # App level token, used for apps.connections.open
+  # Enable Socket Mode in the app settings and configure this token to have connections:write scope.
+  websocket_token: xapp-your-token
   # A token for a donor workspace used to provide avatars.
   avatar_pilfering_token: xoxs-your-token
   # Channel to write error messages to
